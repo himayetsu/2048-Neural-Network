@@ -36,16 +36,16 @@ const int WINDOW_H = WINDOW_W + 60; // Extra space for score display
 
 // Neural network constants
 const int INPUT_SIZE = 16;  // 4x4 grid flattened
-const int HIDDEN_SIZE = 256;
-const int HIDDEN_SIZE_2 = 128;
+const int HIDDEN_SIZE = 512;
+const int HIDDEN_SIZE_2 = 256;
 const int OUTPUT_SIZE = 4;  // Up, Down, Left, Right
-const float LEARNING_RATE = 0.0005f;
-const float GAMMA = 0.99f;
+const float LEARNING_RATE = 0.0001f;   // Faster learning
+const float GAMMA = 0.95f;             // Short-term focus
 const float EPSILON_START = 1.0f;
-const float EPSILON_END = 0.001f;
-const float EPSILON_DECAY = 0.9995f;
-const int REPLAY_BUFFER_SIZE = 50000;
-const int BATCH_SIZE = 128;
+const float EPSILON_END = 0.01f;       // Keep 1% exploration
+const float EPSILON_DECAY = 0.9999f;   // Slower decay
+const int REPLAY_BUFFER_SIZE = 100000; // More memory
+const int BATCH_SIZE = 256;            // Larger batches
 const int TRAIN_EVERY = 4;
 const int TARGET_UPDATE_EVERY = 1000;
 const int SAVE_EVERY = 100;  // Save model every N episodes
@@ -153,7 +153,7 @@ private:
     // Neural network components
     QNet q_network;
     QNet target_network;
-    torch::optim::Adam optimizer;
+    std::unique_ptr<torch::optim::Adam> optimizer;
     
     std::deque<Experience> replay_buffer;
     float epsilon = EPSILON_START;
@@ -177,15 +177,14 @@ Game2048::Game2048(bool render, const std::string& model_path)
       model_save_path(model_path.empty() ? "2048_model.pt" : model_path),
       q_network(QNet()),
       target_network(QNet()),
-      optimizer(q_network->parameters(), torch::optim::AdamOptions(LEARNING_RATE)) {
+      optimizer(nullptr) {
     rng.seed((unsigned)std::chrono::system_clock::now().time_since_epoch().count());
     
-    // Move networks to GPU if available
     q_network->to(device);
     target_network->to(device);
     
-    // Recreate optimizer with GPU parameters
-    optimizer = torch::optim::Adam(q_network->parameters(), torch::optim::AdamOptions(LEARNING_RATE));
+    optimizer = std::make_unique<torch::optim::Adam>(
+        q_network->parameters(), torch::optim::AdamOptions(LEARNING_RATE));
     
     // Copy initial weights to target network
     torch::NoGradGuard no_grad;
@@ -546,17 +545,9 @@ int Game2048::select_action(const vec_t& state) {
 }
 
 float Game2048::step(int action, bool should_print) {
-    (void)should_print;  // Unused
+    (void)should_print;
     int old_score = score;
     int old_max = max_tile;
-    int old_empty = 0;
-    
-    // Count empty cells before move
-    for (int i = 0; i < GRID_SIZE; i++) {
-        for (int j = 0; j < GRID_SIZE; j++) {
-            if (grid[i][j] == 0) old_empty++;
-        }
-    }
     
     Dir dir = static_cast<Dir>(action);
     bool valid_move = move(dir);
@@ -567,47 +558,49 @@ float Game2048::step(int action, bool should_print) {
         moves_made++;
         spawn_tile();
         
-        // Reward based on score increase
+        // Reward merges (score increase)
         int score_gained = score - old_score;
-        reward += (float)score_gained / 100.0f;
+        reward += (float)score_gained / 50.0f;
         
-        // Bonus for reaching new max tile
+        // Big bonus for new max tile
         if (max_tile > old_max) {
-            reward += std::log2((float)max_tile) * 0.5f;
+            reward += std::log2((float)max_tile);
         }
         
-        // Small reward for keeping tiles on edges/corners
-        if (grid[0][0] == max_tile || grid[0][3] == max_tile ||
-            grid[3][0] == max_tile || grid[3][3] == max_tile) {
-            reward += 0.1f;
-        }
-        
-        // Count empty cells after move
-        int new_empty = 0;
-        for (int i = 0; i < GRID_SIZE; i++) {
-            for (int j = 0; j < GRID_SIZE; j++) {
-                if (grid[i][j] == 0) new_empty++;
+        // Reward keeping max tile in corner (key 2048 strategy)
+        int corners[] = {grid[0][0], grid[0][3], grid[3][0], grid[3][3]};
+        for (int c : corners) {
+            if (c == max_tile) {
+                reward += 0.5f;
+                break;
             }
         }
         
-        // Small reward for creating empty space
-        if (new_empty > old_empty) {
-            reward += 0.05f * (new_empty - old_empty);
+        // Reward monotonic rows/columns (tiles in order = good)
+        auto is_monotonic = [](int a, int b, int c, int d) {
+            return (a >= b && b >= c && c >= d) || (a <= b && b <= c && c <= d);
+        };
+        for (int i = 0; i < 4; i++) {
+            if (is_monotonic(grid[i][0], grid[i][1], grid[i][2], grid[i][3])) reward += 0.1f;
+            if (is_monotonic(grid[0][i], grid[1][i], grid[2][i], grid[3][i])) reward += 0.1f;
         }
         
+        // Count empty cells - more empty = more options
+        int empty = 0;
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                if (grid[i][j] == 0) empty++;
+        reward += empty * 0.1f;
+        
     } else {
-        // Penalty for invalid move
         invalid_moves++;
-        reward = -0.5f;
+        reward = -1.0f;  // Harsh penalty for invalid moves
     }
     
-    // Check game over
     if (!can_move()) {
         game_over = true;
-        reward -= 1.0f;  // Penalty for game over
-        
-        // Bonus based on final max tile
-        reward += std::log2((float)max_tile) * 0.2f;
+        reward -= 2.0f;
+        reward += std::log2((float)max_tile) * 0.5f;  // Consolation for high tiles
     }
     
     return reward;
@@ -937,13 +930,13 @@ void Game2048::train_step() {
     avg_loss = (avg_loss * loss_count + loss_val) / (loss_count + 1);
     loss_count++;
     
-    optimizer.zero_grad();
+    optimizer->zero_grad();
     loss.backward();
     
     // Gradient clipping
     torch::nn::utils::clip_grad_norm_(q_network->parameters(), 1.0);
     
-    optimizer.step();
+    optimizer->step();
     
     // Update target network periodically (copy Q-network weights to target)
     if (total_steps % TARGET_UPDATE_EVERY == 0) {
