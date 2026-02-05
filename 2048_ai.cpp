@@ -700,7 +700,7 @@ float Game2048::step(int action, bool should_print) {
         
     } else {
         invalid_moves++;
-        reward = -10.0f;  // Strong penalty for invalid moves (they won't count as steps)
+        reward = -2.0f;  // Was -1.0, now -2.0 (stronger penalty)
     }
     
     if (!can_move()) {
@@ -1096,39 +1096,21 @@ void Game2048::train(int episodes) {
             }
             
             int action = select_action(state);
-            
-            // Save current state to check if move changes anything
-            vec_t state_before = state;
             float reward = step(action, false);
+            auto next_state = get_state();
             
-            // Check if move was valid (invalid moves have reward <= -5.0)
-            // Also check if state actually changed
-            auto state_after = get_state();
-            bool state_changed = false;
-            for (size_t i = 0; i < state_before.size(); i++) {
-                if (std::abs(state_before[i] - state_after[i]) > 0.001f) {
-                    state_changed = true;
-                    break;
-                }
+            replay_buffer.push_back({state, action, reward, next_state, game_over});
+            if (replay_buffer.size() > REPLAY_BUFFER_SIZE) {
+                replay_buffer.pop_front();
             }
             
-            // Only advance if move was valid (state changed)
-            if (state_changed && reward > -5.0f) {
-                replay_buffer.push_back({state_before, action, reward, state_after, game_over});
-                if (replay_buffer.size() > REPLAY_BUFFER_SIZE) {
-                    replay_buffer.pop_front();
-                }
-                
-                if (total_steps % TRAIN_EVERY == 0 && replay_buffer.size() >= BATCH_SIZE) {
-                    train_step();
-                }
-                
-                state = state_after;
-                ep_steps++;
-                total_steps++;
+            if (total_steps % TRAIN_EVERY == 0 && replay_buffer.size() >= BATCH_SIZE) {
+                train_step();
             }
-            // Invalid move - state didn't change, don't count as step
-            // AI will try again with different action on next iteration
+            
+            state = next_state;
+            ep_steps++;
+            total_steps++;
             
             // Render every step - no sleep, no freeze!
             if (render_mode && ep_steps % 2 == 0) {  // Every 2nd step to reduce load
