@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <sstream>
 #include <fstream>
+#include <map>
 
 volatile std::sig_atomic_t force_render_next = 0;
 volatile std::sig_atomic_t should_quit = 0;
@@ -36,16 +37,16 @@ const int WINDOW_H = WINDOW_W + 60; // Extra space for score display
 
 // Neural network constants
 const int INPUT_SIZE = 16;  // 4x4 grid flattened
-const int HIDDEN_SIZE = 512;
-const int HIDDEN_SIZE_2 = 256;
+const int HIDDEN_SIZE = 256;
+const int HIDDEN_SIZE_2 = 128;
 const int OUTPUT_SIZE = 4;  // Up, Down, Left, Right
-const float LEARNING_RATE = 0.0001f;   // Faster learning
-const float GAMMA = 0.95f;             // Short-term focus
+const float LEARNING_RATE = 0.0001f;
+const float GAMMA = 0.99f;             // Long-term planning
 const float EPSILON_START = 1.0f;
 const float EPSILON_END = 0.01f;       // Keep 1% exploration
-const float EPSILON_DECAY = 0.9999f;   // Slower decay
-const int REPLAY_BUFFER_SIZE = 100000; // More memory
-const int BATCH_SIZE = 256;            // Larger batches
+const float EPSILON_DECAY = 0.9999f;   
+const int REPLAY_BUFFER_SIZE = 100000;
+const int BATCH_SIZE = 256;            
 const int TRAIN_EVERY = 4;
 const int TARGET_UPDATE_EVERY = 1000;
 const int SAVE_EVERY = 100;  // Save model every N episodes
@@ -170,6 +171,15 @@ private:
     float avg_loss = 0.0f;
     int loss_count = 0;
     int last_episode_score = 0;
+    
+    // Milestone tracking
+    std::map<int, int> milestones;  // tile -> episode when first reached
+    int high_score = 0;
+    int high_score_episode = 0;
+    
+    void update_milestones(int tile, int episode, int score);
+    void save_milestones(const std::string& path);
+    void load_milestones(const std::string& path);
 };
 
 Game2048::Game2048(bool render, const std::string& model_path)
@@ -227,6 +237,9 @@ void Game2048::save_model(const std::string& path) {
             state_file << episode_count << "\n";
             state_file.close();
         }
+        
+        // Save milestones
+        save_milestones(path);
     } catch (const std::exception& e) {
         std::cerr << "Error saving model: " << e.what() << "\n";
     }
@@ -260,11 +273,74 @@ bool Game2048::load_model(const std::string& path) {
                       << ", episodes=" << episode_count << "\n";
         }
         
+        // Load milestones
+        load_milestones(path);
+        
         std::cout << "Loaded model from " << path << "\n";
         return true;
     } catch (const std::exception& e) {
         std::cout << "No existing model found at " << path << ", starting fresh.\n";
         return false;
+    }
+}
+
+void Game2048::update_milestones(int tile, int episode, int episode_score) {
+    bool new_milestone = false;
+    bool new_high_score = false;
+    
+    // Check tile milestones (64, 128, 256, 512, 1024, 2048, 4096, etc.)
+    int milestone_tiles[] = {64, 128, 256, 512, 1024, 2048, 4096, 8192};
+    for (int milestone : milestone_tiles) {
+        if (tile >= milestone && milestones.find(milestone) == milestones.end()) {
+            milestones[milestone] = episode;
+            new_milestone = true;
+            // Append to file immediately
+            std::ofstream file(model_save_path + ".milestones", std::ios::app);
+            if (file.is_open()) {
+                file << "MILESTONE " << milestone << " " << episode << "\n";
+                file.close();
+            }
+        }
+    }
+    
+    // Check high score
+    if (episode_score > high_score) {
+        high_score = episode_score;
+        high_score_episode = episode;
+        new_high_score = true;
+        // Append to file immediately
+        std::ofstream file(model_save_path + ".milestones", std::ios::app);
+        if (file.is_open()) {
+            file << "HIGH_SCORE " << high_score << " " << high_score_episode << "\n";
+            file.close();
+        }
+    }
+}
+
+void Game2048::save_milestones(const std::string& path) {
+    // Milestones are now saved immediately when reached (appended to file)
+    // This function is kept for compatibility but doesn't need to do anything
+    // since milestones are appended in real-time
+}
+
+void Game2048::load_milestones(const std::string& path) {
+    std::ifstream file(path + ".milestones");
+    if (file.is_open()) {
+        std::string line;
+        while (std::getline(file, line)) {
+            std::istringstream iss(line);
+            std::string type;
+            iss >> type;
+            
+            if (type == "HIGH_SCORE") {
+                iss >> high_score >> high_score_episode;
+            } else if (type == "MILESTONE") {
+                int tile, episode;
+                iss >> tile >> episode;
+                milestones[tile] = episode;
+            }
+        }
+        file.close();
     }
 }
 
@@ -558,49 +634,83 @@ float Game2048::step(int action, bool should_print) {
         moves_made++;
         spawn_tile();
         
-        // Reward merges (score increase)
+        // MUCH LARGER reward for merges (score increase) - this is the main goal!
         int score_gained = score - old_score;
-        reward += (float)score_gained / 50.0f;
+        reward += (float)score_gained / 10.0f;  // Was /50, now /10 (5x larger)
         
-        // Big bonus for new max tile
+        // HUGE bonus for reaching new max tile milestones
         if (max_tile > old_max) {
-            reward += std::log2((float)max_tile);
+            float tile_bonus = std::log2((float)max_tile) * 2.0f;  // Was 1.0, now 2.0
+            // Extra bonus for reaching key milestones
+            if (max_tile >= 256) tile_bonus += 5.0f;
+            if (max_tile >= 512) tile_bonus += 10.0f;
+            if (max_tile >= 1024) tile_bonus += 20.0f;
+            if (max_tile >= 2048) tile_bonus += 50.0f;
+            reward += tile_bonus;
         }
         
-        // Reward keeping max tile in corner (key 2048 strategy)
+        // Strong reward for keeping max tile in corner (CRITICAL 2048 strategy)
         int corners[] = {grid[0][0], grid[0][3], grid[3][0], grid[3][3]};
+        bool max_in_corner = false;
         for (int c : corners) {
             if (c == max_tile) {
-                reward += 0.5f;
+                reward += 2.0f;  // Was 0.5, now 2.0 (4x larger)
+                max_in_corner = true;
                 break;
             }
         }
         
-        // Reward monotonic rows/columns (tiles in order = good)
+        // Reward monotonic rows/columns (tiles in order = good strategy)
         auto is_monotonic = [](int a, int b, int c, int d) {
             return (a >= b && b >= c && c >= d) || (a <= b && b <= c && c <= d);
         };
+        int monotonic_count = 0;
         for (int i = 0; i < 4; i++) {
-            if (is_monotonic(grid[i][0], grid[i][1], grid[i][2], grid[i][3])) reward += 0.1f;
-            if (is_monotonic(grid[0][i], grid[1][i], grid[2][i], grid[3][i])) reward += 0.1f;
+            if (is_monotonic(grid[i][0], grid[i][1], grid[i][2], grid[i][3])) monotonic_count++;
+            if (is_monotonic(grid[0][i], grid[1][i], grid[2][i], grid[3][i])) monotonic_count++;
         }
+        reward += monotonic_count * 0.5f;  // Was 0.1, now 0.5 per row/col
         
-        // Count empty cells - more empty = more options
+        // Count empty cells - more empty = more options (but don't over-reward)
         int empty = 0;
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
                 if (grid[i][j] == 0) empty++;
-        reward += empty * 0.1f;
+        reward += empty * 0.2f;  // Was 0.1, now 0.2
+        
+        // NEW: Reward for having high tiles near the max tile (building strategy)
+        if (max_in_corner) {
+            int adjacent_high = 0;
+            // Check tiles adjacent to corner with max tile
+            if (grid[0][0] == max_tile) {
+                if (grid[0][1] >= max_tile / 4) adjacent_high++;
+                if (grid[1][0] >= max_tile / 4) adjacent_high++;
+            } else if (grid[0][3] == max_tile) {
+                if (grid[0][2] >= max_tile / 4) adjacent_high++;
+                if (grid[1][3] >= max_tile / 4) adjacent_high++;
+            } else if (grid[3][0] == max_tile) {
+                if (grid[3][1] >= max_tile / 4) adjacent_high++;
+                if (grid[2][0] >= max_tile / 4) adjacent_high++;
+            } else if (grid[3][3] == max_tile) {
+                if (grid[3][2] >= max_tile / 4) adjacent_high++;
+                if (grid[2][3] >= max_tile / 4) adjacent_high++;
+            }
+            reward += adjacent_high * 1.0f;
+        }
         
     } else {
         invalid_moves++;
-        reward = -1.0f;  // Harsh penalty for invalid moves
+        reward = -10.0f;  // Strong penalty for invalid moves (they won't count as steps)
     }
     
     if (!can_move()) {
         game_over = true;
-        reward -= 2.0f;
-        reward += std::log2((float)max_tile) * 0.5f;  // Consolation for high tiles
+        reward -= 5.0f;  // Was -2.0, now -5.0 (stronger game over penalty)
+        // But give consolation based on final achievement
+        reward += std::log2((float)max_tile) * 1.0f;  // Was 0.5, now 1.0
+        if (max_tile >= 512) reward += 10.0f;
+        if (max_tile >= 1024) reward += 50.0f;
+        if (max_tile >= 2048) reward += 100.0f;
     }
     
     return reward;
@@ -986,21 +1096,39 @@ void Game2048::train(int episodes) {
             }
             
             int action = select_action(state);
+            
+            // Save current state to check if move changes anything
+            vec_t state_before = state;
             float reward = step(action, false);
-            auto next_state = get_state();
             
-            replay_buffer.push_back({state, action, reward, next_state, game_over});
-            if (replay_buffer.size() > REPLAY_BUFFER_SIZE) {
-                replay_buffer.pop_front();
+            // Check if move was valid (invalid moves have reward <= -5.0)
+            // Also check if state actually changed
+            auto state_after = get_state();
+            bool state_changed = false;
+            for (size_t i = 0; i < state_before.size(); i++) {
+                if (std::abs(state_before[i] - state_after[i]) > 0.001f) {
+                    state_changed = true;
+                    break;
+                }
             }
             
-            if (total_steps % TRAIN_EVERY == 0 && replay_buffer.size() >= BATCH_SIZE) {
-                train_step();
+            // Only advance if move was valid (state changed)
+            if (state_changed && reward > -5.0f) {
+                replay_buffer.push_back({state_before, action, reward, state_after, game_over});
+                if (replay_buffer.size() > REPLAY_BUFFER_SIZE) {
+                    replay_buffer.pop_front();
+                }
+                
+                if (total_steps % TRAIN_EVERY == 0 && replay_buffer.size() >= BATCH_SIZE) {
+                    train_step();
+                }
+                
+                state = state_after;
+                ep_steps++;
+                total_steps++;
             }
-            
-            state = next_state;
-            ep_steps++;
-            total_steps++;
+            // Invalid move - state didn't change, don't count as step
+            // AI will try again with different action on next iteration
             
             // Render every step - no sleep, no freeze!
             if (render_mode && ep_steps % 2 == 0) {  // Every 2nd step to reduce load
@@ -1013,8 +1141,15 @@ void Game2048::train(int episodes) {
         last_episode_score = score;
         total_score += score;
         max_score = std::max(max_score, score);
-        if (max_tile > max_tile_ever) max_tile_ever = max_tile;
+        bool new_max_tile = false;
+        if (max_tile > max_tile_ever) {
+            max_tile_ever = max_tile;
+            new_max_tile = true;
+        }
         if (max_tile >= 2048) games_reaching_2048++;
+        
+        // Update milestones (checks both tile milestones and high score)
+        update_milestones(max_tile, ep, score);
         
         epsilon = std::max(EPSILON_END, epsilon * EPSILON_DECAY);
         
@@ -1043,8 +1178,9 @@ void Game2048::train(int episodes) {
     std::cout << "\n╔══════════════════════════════════════════════════════════════════╗\n";
     std::cout << "║                         Training Complete!                        ║\n";
     std::cout << "║ Best Score: " << std::setw(6) << max_score 
-              << "  |  Highest Tile: " << std::setw(5) << max_tile_ever 
-              << "  |  2048 Games: " << std::setw(4) << games_reaching_2048 << " ║\n";
+              << "  |  Highest Tile: " << std::setw(5) << max_tile_ever
+              << std::setw(20) << "║\n";
+    std::cout << "║ 2048 Games: " << std::setw(4) << games_reaching_2048 << std::setw(44) << "║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════════╝\n";
 }
 
