@@ -16,13 +16,14 @@ LDFLAGS += -ltorch -ltorch_cpu -lc10 -lpthread
 
 TARGET = 2048_ai
 SRC = 2048_ai.cpp
+COMPONENTS = game_engine.cpp training.cpp training_visualization.cpp
 
 .PHONY: all clean run
 
 all: $(TARGET)
 
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+$(TARGET): $(SRC) $(COMPONENTS)
+	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET)
