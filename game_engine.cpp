@@ -12,12 +12,20 @@ namespace ai2048 {
 constexpr int kGridSize = 4;
 constexpr int kInputSize = kGridSize * kGridSize;
 constexpr int kActionCount = 4;
+constexpr int kSymmetryCount = 8;
 
 using Board = std::array<std::array<int, kGridSize>, kGridSize>;
 using State = std::array<float, kInputSize>;
 using ActionMask = std::array<bool, kActionCount>;
 
 enum class Direction { Up = 0, Down = 1, Left = 2, Right = 3 };
+
+// Symmetries 0..7 first reflect columns for ids >= 4, then rotate clockwise
+// (id % 4) times. Actions and legal-action masks use the same coordinate map.
+Board transform_board(const Board& board, int symmetry);
+State transform_state(const State& state, int symmetry);
+int transform_action(int action, int symmetry);
+ActionMask transform_actions(const ActionMask& actions, int symmetry);
 
 struct MoveResult {
     bool moved;
@@ -78,6 +86,24 @@ void validate_action(int action) {
     }
 }
 
+void validate_symmetry(int symmetry) {
+    if (symmetry < 0 || symmetry >= kSymmetryCount) {
+        throw std::out_of_range("2048 symmetry must be between 0 and 7");
+    }
+}
+
+std::pair<int, int> transformed_cell(int row, int column, int symmetry) {
+    if (symmetry >= 4) {
+        column = kGridSize - 1 - column;
+    }
+    for (int rotation = 0; rotation < symmetry % 4; ++rotation) {
+        const int next_row = column;
+        column = kGridSize - 1 - row;
+        row = next_row;
+    }
+    return {row, column};
+}
+
 std::pair<int, int> cell_for(Direction direction, int line, int offset) {
     switch (direction) {
         case Direction::Up: return {offset, line};
@@ -136,6 +162,60 @@ int largest_tile(const Board& board) {
 }
 
 }  // namespace
+
+Board transform_board(const Board& board, int symmetry) {
+    validate_symmetry(symmetry);
+    Board result{};
+    for (int row = 0; row < kGridSize; ++row) {
+        for (int column = 0; column < kGridSize; ++column) {
+            const auto [next_row, next_column] = transformed_cell(row, column, symmetry);
+            result[next_row][next_column] = board[row][column];
+        }
+    }
+    return result;
+}
+
+State transform_state(const State& state, int symmetry) {
+    validate_symmetry(symmetry);
+    State result{};
+    for (int row = 0; row < kGridSize; ++row) {
+        for (int column = 0; column < kGridSize; ++column) {
+            const auto [next_row, next_column] = transformed_cell(row, column, symmetry);
+            result[next_row * kGridSize + next_column] = state[row * kGridSize + column];
+        }
+    }
+    return result;
+}
+
+int transform_action(int action, int symmetry) {
+    validate_action(action);
+    validate_symmetry(symmetry);
+    constexpr std::array<int, kActionCount> row_delta{-1, 1, 0, 0};
+    constexpr std::array<int, kActionCount> column_delta{0, 0, -1, 1};
+    int row = row_delta[action];
+    int column = column_delta[action];
+    if (symmetry >= 4) {
+        column = -column;
+    }
+    for (int rotation = 0; rotation < symmetry % 4; ++rotation) {
+        const int next_row = column;
+        column = -row;
+        row = next_row;
+    }
+    if (row == -1) return static_cast<int>(Direction::Up);
+    if (row == 1) return static_cast<int>(Direction::Down);
+    if (column == -1) return static_cast<int>(Direction::Left);
+    return static_cast<int>(Direction::Right);
+}
+
+ActionMask transform_actions(const ActionMask& actions, int symmetry) {
+    validate_symmetry(symmetry);
+    ActionMask result{};
+    for (int action = 0; action < kActionCount; ++action) {
+        result[transform_action(action, symmetry)] = actions[action];
+    }
+    return result;
+}
 
 GameEngine::GameEngine(std::uint32_t seed) : rng_(seed) {
     reset();

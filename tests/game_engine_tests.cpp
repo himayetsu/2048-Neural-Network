@@ -230,6 +230,117 @@ void state_preserves_logarithmic_encoding() {
     }
 }
 
+void symmetry_maps_preserve_coordinates_and_actions() {
+    const std::array<State, kSymmetryCount> expected_states{{
+        {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+        {13, 9, 5, 1, 14, 10, 6, 2, 15, 11, 7, 3, 16, 12, 8, 4},
+        {16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+        {4, 8, 12, 16, 3, 7, 11, 15, 2, 6, 10, 14, 1, 5, 9, 13},
+        {4, 3, 2, 1, 8, 7, 6, 5, 12, 11, 10, 9, 16, 15, 14, 13},
+        {16, 12, 8, 4, 15, 11, 7, 3, 14, 10, 6, 2, 13, 9, 5, 1},
+        {13, 14, 15, 16, 9, 10, 11, 12, 5, 6, 7, 8, 1, 2, 3, 4},
+        {1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15, 4, 8, 12, 16},
+    }};
+    const std::array<std::array<int, kActionCount>, kSymmetryCount> expected_actions{{
+        {0, 1, 2, 3}, {3, 2, 0, 1}, {1, 0, 3, 2}, {2, 3, 1, 0},
+        {0, 1, 3, 2}, {3, 2, 1, 0}, {1, 0, 2, 3}, {2, 3, 0, 1},
+    }};
+    const std::array<int, kSymmetryCount> inverse{0, 3, 2, 1, 4, 5, 6, 7};
+    const State original = expected_states[0];
+    Board board{};
+    for (int index = 0; index < kInputSize; ++index) {
+        board[index / kGridSize][index % kGridSize] = 1 << (index + 1);
+    }
+    for (int symmetry = 0; symmetry < kSymmetryCount; ++symmetry) {
+        const std::string context = "symmetry " + std::to_string(symmetry) + ": ";
+        const auto state = transform_state(original, symmetry);
+        const auto transformed_board = transform_board(board, symmetry);
+        require(state == expected_states[symmetry], context + "unexpected reflect-then-clockwise coordinate mapping");
+        for (int index = 0; index < kInputSize; ++index) {
+            require(transformed_board[index / kGridSize][index % kGridSize] ==
+                        (1 << static_cast<int>(expected_states[symmetry][index])),
+                    context + "board and state coordinates disagree at cell " + std::to_string(index));
+        }
+        require(transform_state(state, inverse[symmetry]) == original,
+                context + "inverse transform must recover every original state cell");
+        require(transform_board(transformed_board, inverse[symmetry]) == board,
+                context + "inverse transform must recover every original board cell");
+        std::array<bool, kActionCount> seen{};
+        for (int action = 0; action < kActionCount; ++action) {
+            const int transformed_action = transform_action(action, symmetry);
+            const std::string action_context = context + "action " + std::to_string(action) + ": ";
+            require(transformed_action == expected_actions[symmetry][action],
+                    action_context + "direction must follow the same coordinate transform");
+            require(!seen[transformed_action], action_context + "direction map must be one-to-one");
+            seen[transformed_action] = true;
+            require(transform_action(transformed_action, inverse[symmetry]) == action,
+                    action_context + "inverse transform must recover the original direction");
+            ActionMask mask{};
+            mask[action] = true;
+            ActionMask expected_mask{};
+            expected_mask[expected_actions[symmetry][action]] = true;
+            require(transform_actions(mask, symmetry) == expected_mask,
+                    action_context + "legal mask must follow the direction permutation");
+        }
+    }
+}
+
+void transformed_moves_preserve_boards_rewards_and_legal_masks() {
+    struct Case {
+        const char* name;
+        Board board;
+    };
+    const Case cases[] = {
+        {"sparse mergeable", {{{2, 2, 4, 0}, {8, 0, 8, 16}, {0, 32, 0, 32}, {64, 128, 256, 512}}}},
+        {"horizontal only", {{{2, 2, 8, 16}, {8, 16, 32, 64}, {16, 32, 64, 128}, {32, 64, 128, 256}}}},
+        {"terminal", {{{2, 4, 8, 16}, {4, 8, 16, 32}, {8, 16, 32, 64}, {16, 32, 64, 128}}}},
+    };
+    for (const auto& test : cases) {
+        for (int symmetry = 0; symmetry < kSymmetryCount; ++symmetry) {
+            for (int action = 0; action < kActionCount; ++action) {
+                const std::string context = std::string("move symmetry ") + test.name + ", transform " +
+                    std::to_string(symmetry) + ", action " + std::to_string(action) + ": ";
+                GameEngine original(11);
+                GameEngine transformed(11);
+                original.set_board(test.board, 24);
+                transformed.set_board(transform_board(test.board, symmetry), 24);
+                require(transformed.state() == transform_state(original.state(), symmetry),
+                        context + "encoding must commute with transforming the board");
+                require(transformed.valid_actions() == transform_actions(original.valid_actions(), symmetry),
+                        context + "legal moves must match before the move");
+                const bool moved = original.move(static_cast<Direction>(action));
+                const bool transformed_moved = transformed.move(static_cast<Direction>(transform_action(action, symmetry)));
+                require(transformed_moved == moved, context + "move/no-op status must be unchanged");
+                require(transformed.board() == transform_board(original.board(), symmetry),
+                        context + "deterministic move must commute with transforming the board");
+                require(transformed.score() == original.score(), context + "merge reward must be identical");
+                require(transformed.max_tile() == original.max_tile(), context + "maximum tile must be identical");
+                require(transformed.valid_actions() == transform_actions(original.valid_actions(), symmetry),
+                        context + "legal moves must match after the move");
+                require(transformed.game_over() == original.game_over(), context + "terminal status must be identical");
+            }
+        }
+    }
+}
+
+void symmetry_inputs_are_validated() {
+    for (int symmetry : {-1, kSymmetryCount}) {
+        const std::string context = "symmetry validation " + std::to_string(symmetry) + ": ";
+        require_throws<std::out_of_range>([&] { transform_state(State{}, symmetry); },
+                                        context + "state transform should reject an invalid id");
+        require_throws<std::out_of_range>([&] { transform_board(Board{}, symmetry); },
+                                        context + "board transform should reject an invalid id");
+        require_throws<std::out_of_range>([&] { transform_action(0, symmetry); },
+                                        context + "action transform should reject an invalid id");
+        require_throws<std::out_of_range>([&] { transform_actions(ActionMask{}, symmetry); },
+                                        context + "mask transform should reject an invalid id");
+    }
+    for (int action : {-1, kActionCount}) {
+        require_throws<std::out_of_range>([&] { transform_action(action, 0); },
+                                        "symmetry action validation: reject action " + std::to_string(action));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -246,6 +357,9 @@ int main() {
         invalid_move_does_not_consume_spawn_randomness();
         board_and_action_validation();
         state_preserves_logarithmic_encoding();
+        symmetry_maps_preserve_coordinates_and_actions();
+        transformed_moves_preserve_boards_rewards_and_legal_masks();
+        symmetry_inputs_are_validated();
         std::cout << "All game engine tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

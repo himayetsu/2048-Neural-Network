@@ -25,6 +25,7 @@ struct TrainingStatus {
     bool evaluation = false;
     int action = -1;
     bool exploratory = false;
+    bool lookahead = false;
 };
 
 struct NetworkSnapshot {
@@ -41,6 +42,7 @@ struct NetworkSnapshot {
 
 #include <torch/torch.h>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <random>
@@ -68,6 +70,9 @@ struct TrainingConfig {
     int target_update_every = 250; // Optimizer updates, not episodes.
     int max_episode_steps = 5000;
     uint32_t seed = 42;
+    int n_step = 1;
+    bool symmetry_augmentation = false;
+    bool lookahead = false;
 };
 
 struct Experience {
@@ -77,6 +82,22 @@ struct Experience {
     State next_state;
     ActionMask next_valid;
     bool done;
+    int horizon = 1;
+};
+
+// Converts consecutive one-step transitions into discounted replay entries.
+// flush() also preserves bootstrap state for tails ending at a move limit.
+class NStepAccumulator {
+public:
+    NStepAccumulator(int n_step, float gamma);
+    std::vector<Experience> push(const Experience&);
+    std::vector<Experience> flush();
+
+private:
+    Experience aggregate_front() const;
+    int n_step_;
+    float gamma_;
+    std::deque<Experience> pending_;
 };
 
 struct ActionSelection { int action; bool exploratory; };
@@ -106,12 +127,16 @@ struct TrainingCallbacks {
 // Terminal rows never bootstrap, including rows with no legal actions.
 torch::Tensor double_dqn_targets(const torch::Tensor& rewards,
     const torch::Tensor& dones, const torch::Tensor& online_next,
-    const torch::Tensor& target_next, const torch::Tensor& legal, float gamma);
+    const torch::Tensor& target_next, const torch::Tensor& legal, float gamma,
+    const torch::Tensor& horizons = {});
 
 class DQNTrainer {
 public:
     explicit DQNTrainer(TrainingConfig config = {}, torch::Device device = torch::kCPU);
     ActionSelection select_action(const State&, const ActionMask&, float exploration);
+    ActionSelection select_action(const GameEngine&, float exploration);
+    std::array<double, kActionCount> lookahead_values(const GameEngine&);
+    void enable_lookahead(bool enabled);
     void remember(const Experience&);
     float optimize(); // Requires at least batch_size transitions.
     void sync_target();
@@ -120,6 +145,10 @@ public:
                               const TrainingCallbacks& callbacks = {});
     void save(const std::string& path);
     bool load(const std::string& path); // Missing is false; corrupt/incompatible throws.
+    // Apply explicit continuation settings after load(), before replay warmup.
+    void configure_learning(float gamma, int n_step, bool symmetry,
+                            int train_every, int target_update_every);
+    void configure_learning_rate(double learning_rate);
     float epsilon() const;
     TrainingStatus status() const;
     NetworkSnapshot snapshot(const State&, const ActionMask&);
@@ -166,7 +195,8 @@ void validate(const TrainingConfig& c) {
         !(c.gamma >= 0 && c.gamma <= 1) ||
         !(c.epsilon_end >= 0 && c.epsilon_end <= c.epsilon_start && c.epsilon_start <= 1) ||
         c.exploration_steps <= 0 || c.batch_size == 0 || c.replay_capacity < c.batch_size ||
-        c.train_every <= 0 || c.target_update_every <= 0 || c.max_episode_steps <= 0)
+        c.train_every <= 0 || c.target_update_every <= 0 || c.max_episode_steps <= 0 ||
+        c.n_step <= 0 || c.n_step > 32)
         throw std::invalid_argument("Invalid training configuration");
 }
 
@@ -182,6 +212,17 @@ int greedy_action(const torch::Tensor& q_values, const ActionMask& valid) {
     for (int i = 0; i < kActionCount; ++i) {
         if (!std::isfinite(q[i])) throw std::runtime_error("Non-finite network output");
         if (valid[i] && (best < 0 || q[i] > q[best])) best = i;
+    }
+    if (best < 0) throw std::invalid_argument("Cannot select an action on a terminal board");
+    return best;
+}
+
+int greedy_action(const std::array<double, kActionCount>& values, const ActionMask& valid) {
+    int best = -1;
+    for (int action = 0; action < kActionCount; ++action) {
+        if (!valid[action]) continue;
+        if (!std::isfinite(values[action])) throw std::runtime_error("Non-finite lookahead value");
+        if (best < 0 || values[action] > values[best]) best = action;
     }
     if (best < 0) throw std::invalid_argument("Cannot select an action on a terminal board");
     return best;
@@ -214,7 +255,8 @@ torch::Tensor QNetImpl::forward(torch::Tensor input) {
 
 torch::Tensor double_dqn_targets(const torch::Tensor& rewards,
     const torch::Tensor& dones, const torch::Tensor& online_next,
-    const torch::Tensor& target_next, const torch::Tensor& legal, float gamma) {
+    const torch::Tensor& target_next, const torch::Tensor& legal, float gamma,
+    const torch::Tensor& horizons) {
     torch::NoGradGuard guard;
     const auto mask = legal.to(torch::kBool);
     auto actions = online_next.masked_fill(~mask, -std::numeric_limits<float>::infinity())
@@ -222,7 +264,55 @@ torch::Tensor double_dqn_targets(const torch::Tensor& rewards,
     auto next = target_next.gather(1, actions).squeeze(1);
     // Set terminal bootstrap to zero BEFORE multiplying: 0 * inf is NaN.
     next = next.masked_fill(dones.to(torch::kBool) | ~mask.any(1), 0);
-    return rewards + gamma * next;
+    if (!horizons.defined()) return rewards + gamma * next;
+    auto discounts = torch::pow(torch::full_like(rewards, gamma), horizons);
+    return rewards + discounts * next;
+}
+
+NStepAccumulator::NStepAccumulator(int n_step, float gamma)
+    : n_step_(n_step), gamma_(gamma) {
+    if (n_step_ <= 0 || n_step_ > 32 || !(gamma_ >= 0 && gamma_ <= 1))
+        throw std::invalid_argument("Invalid n-step return configuration");
+}
+
+Experience NStepAccumulator::aggregate_front() const {
+    Experience result = pending_.front();
+    result.reward = 0;
+    result.horizon = 0;
+    float discount = 1;
+    for (const auto& transition : pending_) {
+        result.reward += discount * transition.reward;
+        ++result.horizon;
+        result.next_state = transition.next_state;
+        result.next_valid = transition.next_valid;
+        result.done = transition.done;
+        if (transition.done || result.horizon == n_step_) break;
+        discount *= gamma_;
+    }
+    return result;
+}
+
+std::vector<Experience> NStepAccumulator::push(const Experience& transition) {
+    if (transition.horizon != 1 || !std::isfinite(transition.reward))
+        throw std::invalid_argument("N-step accumulation needs finite one-step transitions");
+    pending_.push_back(transition);
+    if (transition.done) return flush();
+    std::vector<Experience> ready;
+    if (pending_.size() >= static_cast<size_t>(n_step_)) {
+        ready.push_back(aggregate_front());
+        pending_.pop_front();
+    }
+    return ready;
+}
+
+std::vector<Experience> NStepAccumulator::flush() {
+    std::vector<Experience> ready;
+    ready.reserve(pending_.size());
+    while (!pending_.empty()) {
+        ready.push_back(aggregate_front());
+        pending_.pop_front();
+    }
+    return ready;
 }
 
 DQNTrainer::DQNTrainer(TrainingConfig config, torch::Device device)
@@ -255,8 +345,91 @@ ActionSelection DQNTrainer::select_action(const State& state, const ActionMask& 
     return {greedy_action(policy_->forward(state_tensor(state, device_)), valid), false};
 }
 
+void DQNTrainer::enable_lookahead(bool enabled) {
+    config_.lookahead = enabled;
+}
+
+ActionSelection DQNTrainer::select_action(const GameEngine& game, float exploration) {
+    if (!config_.lookahead) return select_action(game.state(), game.valid_actions(), exploration);
+    if (!(exploration >= 0 && exploration <= 1)) throw std::invalid_argument("Invalid epsilon");
+    const auto legal = game.valid_actions();
+    if (std::uniform_real_distribution<float>(0, 1)(rng_) < exploration)
+        return {random_action(legal, rng_), true};
+    return {greedy_action(lookahead_values(game), legal), false};
+}
+
+std::array<double, kActionCount> DQNTrainer::lookahead_values(const GameEngine& game) {
+    torch::NoGradGuard guard;
+    struct Leaf {
+        int root_action;
+        double probability;
+        ActionMask legal;
+        State state;
+    };
+    std::vector<Leaf> leaves;
+    leaves.reserve(kActionCount * kInputSize * 2);
+    std::array<double, kActionCount> values;
+    values.fill(-std::numeric_limits<double>::infinity());
+    const auto root_legal = game.valid_actions();
+    // Analysis uses deterministic move()/set_board(); it never draws a tile.
+    GameEngine analysis = game;
+    for (int action = 0; action < kActionCount; ++action) {
+        if (!root_legal[action]) continue;
+        analysis.set_board(game.board());
+        if (!analysis.move(static_cast<Direction>(action)))
+            throw std::logic_error("Root legal-action mask disagrees with deterministic move");
+        values[action] = analysis.score() / 100.0;
+        const Board after_board = analysis.board();
+        const State after_state = analysis.state();
+        std::array<std::pair<int, int>, kInputSize> empty{};
+        int empty_count = 0;
+        for (int row = 0; row < kGridSize; ++row)
+            for (int column = 0; column < kGridSize; ++column)
+                if (after_board[row][column] == 0) empty[empty_count++] = {row, column};
+        if (!empty_count) throw std::logic_error("Successful 2048 moves must leave a spawn cell");
+        for (int cell = 0; cell < empty_count; ++cell) {
+            const auto [row, column] = empty[cell];
+            for (int tile : {2, 4}) {
+                auto board = after_board;
+                board[row][column] = tile;
+                analysis.set_board(board);
+                const auto legal = analysis.valid_actions();
+                // Terminal outcomes retain their probability mass and have V=0.
+                if (std::none_of(legal.begin(), legal.end(), [](bool allowed) { return allowed; })) continue;
+                auto state = after_state;
+                state[row * kGridSize + column] = (tile == 2 ? 1.0f : 2.0f) / 17.0f;
+                leaves.push_back({action, (tile == 2 ? 0.9 : 0.1) / empty_count, legal, state});
+            }
+        }
+    }
+    // All nonterminal outcomes across every root move share one network batch.
+    if (!leaves.empty()) {
+        auto inputs = torch::empty({static_cast<int64_t>(leaves.size()), kInputSize}, torch::kFloat32);
+        auto* input_data = inputs.data_ptr<float>();
+        for (size_t row = 0; row < leaves.size(); ++row)
+            std::copy(leaves[row].state.begin(), leaves[row].state.end(), input_data + row * kInputSize);
+        const auto outputs = policy_->forward(inputs.to(device_)).to(torch::kCPU).contiguous();
+        const auto* q_values = outputs.data_ptr<float>();
+        for (size_t row = 0; row < leaves.size(); ++row) {
+            float best = -std::numeric_limits<float>::infinity();
+            for (int action = 0; action < kActionCount; ++action) {
+                const float value = q_values[row * kActionCount + action];
+                if (!std::isfinite(value)) throw std::runtime_error("Non-finite lookahead leaf Q value");
+                if (leaves[row].legal[action]) best = std::max(best, value);
+            }
+            // Keep double accumulation and leaf order identical to the measured probe.
+            values[leaves[row].root_action] += config_.gamma * leaves[row].probability * best;
+        }
+    }
+    for (int action = 0; action < kActionCount; ++action)
+        if (root_legal[action] && !std::isfinite(values[action]))
+            throw std::runtime_error("Non-finite lookahead value");
+    return values;
+}
+
 void DQNTrainer::remember(const Experience& experience) {
-    if (experience.action < 0 || experience.action >= kActionCount || !std::isfinite(experience.reward))
+    if (experience.action < 0 || experience.action >= kActionCount ||
+        !std::isfinite(experience.reward) || experience.horizon <= 0)
         throw std::invalid_argument("Invalid replay transition");
     if (replay_.size() < config_.replay_capacity) replay_.push_back(experience);
     else replay_[replay_next_] = experience;
@@ -272,15 +445,36 @@ float DQNTrainer::optimize() {
     auto rewards = torch::empty({count});
     auto dones = torch::empty({count}, torch::kBool);
     auto masks = torch::empty({count, kActionCount}, torch::kBool);
+    auto horizons = torch::empty({count}, torch::kLong);
+    auto* state_data = states.data_ptr<float>();
+    auto* next_state_data = next_states.data_ptr<float>();
+    auto* action_data = actions.data_ptr<int64_t>();
+    auto* reward_data = rewards.data_ptr<float>();
+    auto* done_data = dones.data_ptr<bool>();
+    auto* mask_data = masks.data_ptr<bool>();
+    auto* horizon_data = horizons.data_ptr<int64_t>();
     std::uniform_int_distribution<size_t> sample(0, replay_.size() - 1);
+    std::uniform_int_distribution<int> symmetry(0, 7);
     for (int64_t row = 0; row < count; ++row) {
         const auto& exp = replay_[sample(rng_)];
-        std::copy(exp.state.begin(), exp.state.end(), states.data_ptr<float>() + row * kInputSize);
-        std::copy(exp.next_state.begin(), exp.next_state.end(), next_states.data_ptr<float>() + row * kInputSize);
-        actions.data_ptr<int64_t>()[row] = exp.action;
-        rewards.data_ptr<float>()[row] = exp.reward;
-        dones.data_ptr<bool>()[row] = exp.done;
-        std::copy(exp.next_valid.begin(), exp.next_valid.end(), masks.data_ptr<bool>() + row * kActionCount);
+        State state = exp.state;
+        State next_state = exp.next_state;
+        ActionMask next_valid = exp.next_valid;
+        int action = exp.action;
+        if (config_.symmetry_augmentation) {
+            const int transform = symmetry(rng_);
+            state = transform_state(state, transform);
+            next_state = transform_state(next_state, transform);
+            action = transform_action(action, transform);
+            next_valid = transform_actions(next_valid, transform);
+        }
+        std::copy(state.begin(), state.end(), state_data + row * kInputSize);
+        std::copy(next_state.begin(), next_state.end(), next_state_data + row * kInputSize);
+        action_data[row] = action;
+        reward_data[row] = exp.reward;
+        done_data[row] = exp.done;
+        std::copy(next_valid.begin(), next_valid.end(), mask_data + row * kActionCount);
+        horizon_data[row] = exp.horizon;
     }
     states = states.to(device_);
     next_states = next_states.to(device_);
@@ -288,11 +482,12 @@ float DQNTrainer::optimize() {
     rewards = rewards.to(device_);
     dones = dones.to(device_);
     masks = masks.to(device_);
+    horizons = horizons.to(device_);
     torch::Tensor targets;
     {
         torch::NoGradGuard guard;
         targets = double_dqn_targets(rewards, dones, policy_->forward(next_states),
-                                    target_->forward(next_states), masks, config_.gamma);
+                                    target_->forward(next_states), masks, config_.gamma, horizons);
     }
     auto predicted = policy_->forward(states).gather(1, actions).squeeze(1);
     auto loss = torch::smooth_l1_loss(predicted, targets);
@@ -323,6 +518,7 @@ TrainingStatus DQNTrainer::status() const {
     status.epsilon = epsilon();
     status.loss = last_loss_;
     status.replay_size = replay_.size();
+    status.lookahead = config_.lookahead;
     return status;
 }
 
@@ -349,6 +545,8 @@ void DQNTrainer::train(int episodes, const TrainingCallbacks& callbacks) {
     for (int n = 0; n < episodes; ++n) {
         // Per-episode seeds keep tile randomness independent of replay sampling.
         GameEngine game(config_.seed + static_cast<uint32_t>(completed_episodes_));
+        // Local to this game: stopped partial games cannot leak into a later train().
+        NStepAccumulator returns(config_.n_step, config_.gamma);
         EpisodeMetrics metrics;
         double loss_sum = 0;
         int loss_count = 0;
@@ -356,7 +554,7 @@ void DQNTrainer::train(int episodes, const TrainingCallbacks& callbacks) {
             if (callbacks.should_stop && callbacks.should_stop()) return;
             auto state = game.state();
             auto valid = game.valid_actions();
-            auto selected = select_action(state, valid, epsilon());
+            auto selected = select_action(game, epsilon());
             auto now = std::chrono::steady_clock::now();
             if (callbacks.on_frame && (last_frame == std::chrono::steady_clock::time_point::min() ||
                 now - last_frame >= std::chrono::milliseconds(33))) {
@@ -369,8 +567,10 @@ void DQNTrainer::train(int episodes, const TrainingCallbacks& callbacks) {
             }
             const auto result = game.step(selected.action);
             // Optimize discounted game score. No per-turn board or terminal bonuses.
-            remember({state, selected.action, result.score_gain / 100.0f,
-                      game.state(), game.valid_actions(), result.done});
+            for (const auto& transition : returns.push(
+                     {state, selected.action, result.score_gain / 100.0f,
+                      game.state(), game.valid_actions(), result.done}))
+                remember(transition);
             ++total_steps_;
             ++metrics.steps;
             if (total_steps_ % config_.train_every == 0 && replay_.size() >= config_.batch_size) {
@@ -378,6 +578,8 @@ void DQNTrainer::train(int episodes, const TrainingCallbacks& callbacks) {
                 ++loss_count;
             }
         }
+        // Nonterminal move-limit tails still bootstrap from the final board.
+        for (const auto& transition : returns.flush()) remember(transition);
         ++completed_episodes_;
         metrics.episode = completed_episodes_;
         metrics.score = game.score();
@@ -401,6 +603,7 @@ EvaluationResult DQNTrainer::evaluate(int episodes, uint32_t seed, bool random_p
     torch::NoGradGuard guard;
     EvaluationResult result;
     std::mt19937 evaluation_rng(seed);
+    auto last_frame = std::chrono::steady_clock::time_point::min();
     for (int episode = 0; episode < episodes; ++episode) {
         GameEngine game(seed + static_cast<uint32_t>(episode));
         EpisodeMetrics metrics;
@@ -411,8 +614,11 @@ EvaluationResult DQNTrainer::evaluate(int episodes, uint32_t seed, bool random_p
             const auto valid = game.valid_actions();
             const auto state = game.state();
             const int action = random_policy ? random_action(valid, evaluation_rng) :
-                greedy_action(policy_->forward(state_tensor(state, device_)), valid);
-            if (callbacks.on_frame) {
+                (config_.lookahead ? greedy_action(lookahead_values(game), valid) :
+                 greedy_action(policy_->forward(state_tensor(state, device_)), valid));
+            const auto now = std::chrono::steady_clock::now();
+            if (callbacks.on_frame && (last_frame == std::chrono::steady_clock::time_point::min() ||
+                now - last_frame >= std::chrono::milliseconds(33))) {
                 auto view = status();
                 view.episodes = episode + 1;
                 view.evaluation = true;
@@ -420,6 +626,7 @@ EvaluationResult DQNTrainer::evaluate(int episodes, uint32_t seed, bool random_p
                 view.action = action;
                 view.exploratory = random_policy;
                 callbacks.on_frame(game, view, snapshot(state, valid));
+                last_frame = now;
             }
             game.step(action);
             ++metrics.steps;
@@ -472,7 +679,8 @@ void DQNTrainer::save(const std::string& path) {
            << config_.learning_rate << ' ' << config_.gamma << ' ' << config_.epsilon_start << ' '
            << config_.epsilon_end << ' ' << config_.exploration_steps << ' ' << config_.replay_capacity
            << ' ' << config_.batch_size << ' ' << config_.train_every << ' ' << config_.target_update_every
-           << ' ' << config_.max_episode_steps << ' ' << config_.seed;
+           << ' ' << config_.max_episode_steps << ' ' << config_.seed
+           << ' ' << config_.n_step << ' ' << config_.symmetry_augmentation << ' ' << config_.lookahead;
     rng << rng_;
     milestones << "HIGH_SCORE " << high_score_ << ' ' << high_score_episode_ << '\n';
     for (auto [tile, episode] : milestones_) milestones << "MILESTONE " << tile << ' ' << episode << '\n';
@@ -510,6 +718,22 @@ bool DQNTrainer::load(const std::string& path) {
           >> saved.exploration_steps >> saved.replay_capacity >> saved.batch_size >> saved.train_every
           >> saved.target_update_every >> saved.max_episode_steps >> saved.seed))
         throw std::runtime_error("Invalid checkpoint configuration");
+    // Version-one archives originally ended at seed. Missing extension fields
+    // intentionally retain the one-step, unaugmented learning configuration.
+    config >> std::ws;
+    if (!config.eof()) {
+        int symmetry;
+        if (!(config >> saved.n_step >> symmetry) || (symmetry != 0 && symmetry != 1))
+            throw std::runtime_error("Invalid checkpoint learning configuration");
+        saved.symmetry_augmentation = symmetry != 0;
+        config >> std::ws;
+        if (!config.eof()) {
+            int lookahead;
+            if (!(config >> lookahead) || (lookahead != 0 && lookahead != 1))
+                throw std::runtime_error("Invalid checkpoint lookahead configuration");
+            saved.lookahead = lookahead != 0;
+        }
+    }
     DQNTrainer restored(saved, device_);
     torch::serialize::InputArchive policy, target, optimizer;
     archive.read("policy", policy);
@@ -540,6 +764,30 @@ bool DQNTrainer::load(const std::string& path) {
     }
     *this = std::move(restored);
     return true;
+}
+
+void DQNTrainer::configure_learning(float gamma, int n_step, bool symmetry,
+                                   int train_every, int target_update_every) {
+    TrainingConfig updated = config_;
+    updated.gamma = gamma;
+    updated.n_step = n_step;
+    updated.symmetry_augmentation = symmetry;
+    updated.train_every = train_every;
+    updated.target_update_every = target_update_every;
+    validate(updated);
+    if (!replay_.empty())
+        throw std::logic_error("Configure learning before replay warmup");
+    config_ = updated;
+}
+
+void DQNTrainer::configure_learning_rate(double learning_rate) {
+    auto updated = config_;
+    updated.learning_rate = learning_rate;
+    validate(updated);
+    // Change only Adam's step size; preserve its accumulated moments and state.
+    optimizer_->defaults().set_lr(learning_rate);
+    for (auto& group : optimizer_->param_groups()) group.options().set_lr(learning_rate);
+    config_ = updated;
 }
 } // namespace ai2048
 

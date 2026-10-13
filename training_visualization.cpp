@@ -59,7 +59,7 @@ constexpr int kNetworkWidth = 1060;
 constexpr int kNetworkHeight = 740;
 constexpr std::array<int, 5> kDisplaySizes{16, 32, 24, 24, 4};
 constexpr std::array<const char*, 5> kLayerNames{
-    "Input", "Hidden 1", "Hidden 2", "Hidden 3", "Q values"};
+    "Input", "Hidden 1", "Hidden 2", "Hidden 3", "Raw Q"};
 constexpr std::array<const char*, 4> kActionNames{"UP", "DOWN", "LEFT", "RIGHT"};
 constexpr std::array<SDL_Color, 13> kTileColors{{
     {205, 193, 180, 255}, {238, 228, 218, 255}, {237, 224, 200, 255},
@@ -75,6 +75,11 @@ void set_color(SDL_Renderer* renderer, SDL_Color color) {
 
 float finite_or_zero(float value) {
     return std::isfinite(value) ? value : 0.0f;
+}
+
+const char* policy_name(const TrainingStatus& status) {
+    if (status.evaluation && status.epsilon >= 1.0f) return "random";
+    return status.lookahead ? "lookahead" : "network";
 }
 
 float activation(const NetworkSnapshot& snapshot, int layer, int index) {
@@ -176,7 +181,8 @@ struct TrainingVisualization::Impl {
         text(renderer, font, score.str(), 10, 6, {119, 110, 101, 255});
         text(renderer, font_small,
              std::string(status.evaluation ? "Evaluation" : "Training") +
-                 "   Episode: " + std::to_string(status.episodes),
+                 "   Episode: " + std::to_string(status.episodes) +
+                 "   Policy: " + policy_name(status),
              10, 38, {119, 110, 101, 255});
         set_color(renderer, {205, 193, 180, 255});
         SDL_Rect background{kCellPadding / 2, 60 + kCellPadding / 2,
@@ -288,7 +294,7 @@ struct TrainingVisualization::Impl {
                 action == greedy_action ? SDL_Color{50, 255, 100, 255} :
                                           SDL_Color{200, 200, 220, 255};
             std::ostringstream label;
-            label << kActionNames[action] << "  Q: " << std::fixed << std::setprecision(3)
+            label << kActionNames[action] << "  Raw Q: " << std::fixed << std::setprecision(3)
                   << snapshot.q_values[action] << (legal ? "  legal" : "  blocked");
             fitted_text(network_renderer, label.str(), 735, y - 27, 310, color);
 
@@ -305,7 +311,8 @@ struct TrainingVisualization::Impl {
             SDL_RenderDrawLine(network_renderer, 865, y - 2, 865, y + 14);
             if (action == status.action) {
                 text(network_renderer, font_small,
-                     status.exploratory ? "SELECTED: random exploration" : "SELECTED: greedy policy",
+                     status.exploratory ? "SELECTED: random exploration" :
+                         status.lookahead ? "SELECTED: lookahead policy" : "SELECTED: network policy",
                      735, y + 24, {245, 245, 255, 255});
             }
         }
@@ -314,7 +321,9 @@ struct TrainingVisualization::Impl {
              status.evaluation ? "2048 Q network - evaluation (no learning)" :
                                  "2048 Q network - live training",
              20, 14, {220, 220, 240, 255});
-        text(network_renderer, font_small, "Q = estimated future reward; highest legal Q is greedy",
+        text(network_renderer, font_small, std::string("Policy: ") + policy_name(status),
+             735, 14, {220, 220, 240, 255});
+        text(network_renderer, font_small, "Raw Q = network estimate of future reward",
              20, 574, {170, 170, 200, 255});
 
         std::ostringstream stats;
@@ -328,7 +337,7 @@ struct TrainingVisualization::Impl {
               << "   Latest loss: " << std::setprecision(5) << status.loss;
         text(network_renderer, font_small, stats.str(), 20, 622, {200, 200, 220, 255});
         text(network_renderer, font_small,
-             "Green outline = best legal Q   White outline = selected move   Bar center = Q of zero",
+             "Green outline = best legal network Q   White outline = selected move   Bar center = Q of zero",
              20, 645, {130, 130, 160, 255});
         text(network_renderer, font_small,
              "Connections: red = positive signal, green = negative signal, brightness = strength",
